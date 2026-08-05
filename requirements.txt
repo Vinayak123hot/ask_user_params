@@ -1,0 +1,14 @@
+# One-time local generator for ask_user_params.json. Install from your APPROVED PRIVATE index.
+#   pip install -r requirements.txt --index-url https://<your-private-index>/simple
+
+# --- Azure OpenAI SDK (GPT-5 mini chat call). openai 2.x, matching the deployed services.
+openai>=2.8.0,<3
+
+# --- Entra ID auth (local: `az login` / VS Code Azure sign-in) — no API keys.
+azure-identity>=1.19
+
+# --- python-docx: extract the article text from the .docx (images are ignored — not needed for params).
+python-docx>=1.1.0
+
+# --- PyYAML: load config.yaml (endpoint, deployment, folder paths).
+PyYAML>=6.0.2

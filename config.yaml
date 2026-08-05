@@ -1,0 +1,15 @@
+##########################################
+# ask_user_params generator — local tool config (non-secret only; auth is Entra ID via `az login`).
+# Edit the deployment name (and endpoint if GPT-5 mini lives elsewhere). CLI flags override these.
+##########################################
+
+azure_openai:
+  endpoint: "https://aifoundry-rjteh-ais-swce-poc.services.ai.azure.com/"   # Azure OpenAI / Foundry AI Services endpoint
+  deployment: "<fill: your gpt-5-mini deployment name>"                      # GPT-5 mini deployment name
+  api_version: "2024-12-01-preview"                                         # Azure OpenAI API version
+  token_scope: "https://ai.azure.com/.default"                              # Foundry AI Services audience (NOT cognitiveservices)
+
+paths:
+  kb_articles_dir: "kb_articles"    # subfolder (in this tool folder) holding <KB>.docx article files
+  scripts_dir: "scripts"            # subfolder holding <KB>.ps1 or <KB>.txt PowerShell script files
+  output: "ask_user_params.json"    # generated output file (merged), written in this tool folder
