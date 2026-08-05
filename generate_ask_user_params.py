@@ -18,6 +18,7 @@ from __future__ import annotations  # Enable postponed evaluation of type annota
 
 import argparse  # Parse command-line options
 import json  # Parse the LLM output + read/write ask_user_params.json
+import re  # Deterministic PowerShell param() extraction (cross-check + backfill of the LLM output)
 import sys  # Exit with a clear status on setup problems
 from pathlib import Path  # Filesystem paths
 from typing import Any, Optional  # Type hints
@@ -105,6 +106,80 @@ def _read_docx_text(docx_path: Path) -> str:  # Extract paragraph + table text f
     return "\n".join(lines)  # The article text
 
 
+def _extract_powershell_params(script_text: str) -> list[dict[str, Any]]:  # Deterministic param() cross-check
+    """Best-effort parse of the FIRST top-level param(...) block -> [{name, required}].
+
+    This is a HEURISTIC (not a full PowerShell parser). It exists so the LLM extraction can be
+    verified and, if the model omits a parameter the script clearly declares, that parameter is
+    still captured instead of silently lost (the empty-`params` bug). `required` follows the same
+    rule the prompt uses: True when the parameter is Mandatory OR has no default; False when it
+    has a default (= ...). Returns [] when the script has no param() block (nothing to cross-check).
+    """
+    header = re.search(r"(?im)^\s*param\s*\(", script_text)  # Locate the first top-level 'param(' (case-insensitive)
+    if not header:  # No param() block -> params may be hardcoded / read via Read-Host -> nothing to extract here
+        return []
+    open_index = script_text.index("(", header.start())  # Index of the '(' that opens the param block
+    depth = 0  # Parenthesis nesting depth
+    end_index = -1  # Index of the matching close ')'
+    for i in range(open_index, len(script_text)):  # Balance parentheses to find the block's end
+        character = script_text[i]  # Current character
+        if character == "(":  # Open paren -> go deeper
+            depth += 1
+        elif character == ")":  # Close paren -> come back up
+            depth -= 1
+            if depth == 0:  # Balanced back to the opening '(' -> block complete
+                end_index = i
+                break
+    if end_index == -1:  # Unbalanced param block -> give up (leave it to the LLM)
+        return []
+    block = script_text[open_index + 1 : end_index]  # The text INSIDE param( ... )
+    segments: list[str] = []  # Top-level, comma-separated parameter segments
+    current: list[str] = []  # Characters of the segment being built
+    depth = 0  # Bracket/paren depth so commas inside [ ] ( ) { } do not split params
+    for character in block:  # Walk the block, splitting on top-level commas only
+        if character in "([{":  # Enter a nested group
+            depth += 1
+        elif character in ")]}":  # Leave a nested group
+            depth -= 1
+        if character == "," and depth == 0:  # Top-level comma -> end of one parameter
+            segments.append("".join(current))
+            current = []
+        else:  # Accumulate the character
+            current.append(character)
+    if "".join(current).strip():  # Flush the final segment
+        segments.append("".join(current))
+    params: list[dict[str, Any]] = []  # Extracted parameters
+    for segment in segments:  # Turn each segment into {name, required}
+        mandatory = re.search(r"(?i)Mandatory\s*=\s*\$true", segment) is not None  # [Parameter(Mandatory=$true)]
+        stripped = re.sub(r"\[[^\[\]]*\]", "", segment)  # Drop [type] / [Parameter(...)] attribute blocks
+        variable = re.search(r"\$(\w+)", stripped)  # The parameter variable ($Name) that remains
+        if not variable:  # No variable in this segment -> skip
+            continue
+        after_variable = stripped.split(variable.group(0), 1)[-1]  # Text after the $Name (may hold a default)
+        has_default = "=" in after_variable  # A '= value' default follows the variable?
+        params.append({  # Record the parameter
+            "name": variable.group(1),  # Parameter name without the leading $
+            "required": mandatory or not has_default,  # Required unless it has a default and is not Mandatory
+        })
+    return params  # Declared parameters (may be empty)
+
+
+def _call_model(client: AzureOpenAI, deployment: str, user_content: str) -> dict[str, Any]:  # One stateless LLM call
+    """Send the fixed system prompt + this payload to GPT-5 mini and return the parsed JSON object."""
+    response = client.chat.completions.create(  # Stateless chat call (NO temperature — GPT-5 family)
+        model=deployment,  # The GPT-5 mini deployment
+        messages=[  # Fixed instruction + this KB's payload
+            {"role": "system", "content": _SYSTEM_PROMPT},  # How to produce the JSON
+            {"role": "user", "content": user_content},  # The script + article (+ any detection hint)
+        ],
+    )
+    raw_text = response.choices[0].message.content or ""  # The model's text output
+    inner = _extract_first_json_object(raw_text)  # Parse the JSON object
+    if inner is None:  # The model didn't return JSON
+        raise ValueError(f"LLM did not return a JSON object. First 500 chars:\n{raw_text[:500]}")
+    return inner  # The parsed {params, allowed_values, examples} object
+
+
 def _find_pairs(kb_articles_dir: Path, scripts_dir: Path, only_kb: Optional[str]) -> list[tuple[str, Path, Path]]:
     """Find (kb_id, docx_path, script_path) triples: each <kb>.docx in kb_articles_dir with a <kb>.ps1/.txt in scripts_dir."""
     triples: list[tuple[str, Path, Path]] = []  # Collected pairs
@@ -127,42 +202,86 @@ def _find_pairs(kb_articles_dir: Path, scripts_dir: Path, only_kb: Optional[str]
 
 def _sanity_check(kb_id: str, entry: dict[str, Any]) -> None:  # Print non-fatal warnings about the generated entry
     """Warn (do not fail) when the generated entry looks off, so you can review before deploying."""
-    declared = {p.get("name") for p in entry.get("params", []) or []}  # Declared parameter names
+    params = entry.get("params", []) or []  # Declared parameter objects
+    declared = {p.get("name") for p in params}  # Declared parameter names
     allowed = entry.get("allowed_values", {}) or {}  # Per-param example values (format guidance)
-    for param in entry.get("params", []) or []:  # Each declared param
+    examples = entry.get("examples", []) or []  # Natural-language examples
+    if not params:  # Empty params is the classic "the model missed the param() block" symptom
+        print(f"    ⚠ {kb_id}: NO parameters were produced — verify the script actually has a param() block "
+              "(or that this KB genuinely needs no user input) before deploying")
+    for param in params:  # Each declared param
         if not allowed.get(param.get("name")):  # No example values -> the model has no format guidance for it
             print(f"    ⚠ {kb_id}: param {param.get('name')!r} has no example values — consider adding a couple")
-    for example in entry.get("examples", []) or []:  # Each example
+    used_in_examples: set[Any] = set()  # Param names actually demonstrated in the examples
+    for example in examples:  # Each example
         for name in (example.get("params", {}) or {}):  # Each param used in the example
+            used_in_examples.add(name)  # Remember it was demonstrated
             if name not in declared:  # References a param not in the params list
                 print(f"    ⚠ {kb_id}: example references undeclared param {name!r} — review")
+    for name in declared:  # Each declared param should appear in at least one example
+        if name not in used_in_examples:  # A declared param no example demonstrates
+            print(f"    ⚠ {kb_id}: declared param {name!r} is not used in any example — add one")
 
 
 def _generate_entry(client: AzureOpenAI, deployment: str, docx_path: Path, script_path: Path) -> dict[str, Any]:  # One KB
-    """Read the article + script, call GPT-5 mini once (stateless), and assemble the ask_user_params entry."""
+    """Read the article + script, call GPT-5 mini (stateless), and assemble the ask_user_params entry.
+
+    Robustness: the script's param() block is parsed deterministically first. Those names are (a) fed
+    to the model as ground truth, (b) used to RETRY once if the model returns no params for a script
+    that clearly declares them, and (c) used to BACKFILL any declared param the model still omits — so
+    a KB whose script has parameters can never silently produce an empty `params` list.
+    """
     article_text = _read_docx_text(docx_path)  # KB article text (images ignored)
     script_text = script_path.read_text(encoding="utf-8", errors="replace")  # PowerShell script text
     script_name = script_path.name if script_path.suffix.lower() == ".ps1" else f"{script_path.stem}.ps1"  # Bare .ps1 name
-    user_content = (  # The single stateless payload: script + article
+
+    detected = _extract_powershell_params(script_text)  # Deterministic {name, required} from the param() block
+    detected_names = [parameter["name"] for parameter in detected]  # Just the declared parameter names
+    detection_hint = (  # Guide the model with the ground-truth names (or tell it none were found)
+        ("\n\nThe script's param() block declares these parameters — extract and describe EACH one and use "
+         f"them in the examples: {', '.join(detected_names)}.")
+        if detected_names else
+        "\n\nNote: no param() block was detected; infer the user-supplied inputs from the code/article, or "
+        "return an empty params list only if the script genuinely needs none."
+    )
+    user_content = (  # The single stateless payload: script + article + detection hint
         f"POWERSHELL SCRIPT (filename: {script_name}):\n```powershell\n{script_text}\n```\n\n"
-        f"KB ARTICLE TEXT:\n{article_text}"
+        f"KB ARTICLE TEXT:\n{article_text}{detection_hint}"
     )
-    response = client.chat.completions.create(  # Stateless chat call (NO temperature — GPT-5 family)
-        model=deployment,  # The GPT-5 mini deployment
-        messages=[  # Fixed instruction + this KB's payload
-            {"role": "system", "content": _SYSTEM_PROMPT},  # How to produce the JSON
-            {"role": "user", "content": user_content},  # The script + article
-        ],
-    )
-    raw_text = response.choices[0].message.content or ""  # The model's text output
-    inner = _extract_first_json_object(raw_text)  # Parse the JSON object
-    if inner is None:  # The model didn't return JSON
-        raise ValueError(f"LLM did not return a JSON object. First 500 chars:\n{raw_text[:500]}")
+
+    inner = _call_model(client, deployment, user_content)  # First attempt
+    params = inner.get("params", []) or []  # Parameter definitions the model returned
+
+    if detected_names and not params:  # Script clearly declares params but the model returned none -> retry once
+        print(f"    ↻ {script_name}: model returned no params though the script declares "
+              f"{detected_names}; retrying with an explicit instruction")
+        forceful_content = user_content + (  # Re-ask, naming the parameters it must return
+            "\n\nIMPORTANT: your previous answer had no parameters. The script DOES take parameters: "
+            f"{', '.join(detected_names)}. Return EACH one in \"params\" with a user-facing description, give a "
+            "few format examples per parameter in allowed_values, and map them in the examples."
+        )
+        inner = _call_model(client, deployment, forceful_content)  # Second (final) attempt
+        params = inner.get("params", []) or []  # Re-read the params
+
+    allowed_values = inner.get("allowed_values", {}) or {}  # Per-param FORMAT EXAMPLES (not an enforced/complete list)
+    examples = inner.get("examples", []) or []  # Natural-language -> params examples
+
+    present = {parameter.get("name") for parameter in params if isinstance(parameter, dict)}  # Names the model gave
+    for parameter in detected:  # Deterministic safety net: never drop a parameter the script declares
+        if parameter["name"] not in present:  # The model omitted a declared parameter -> backfill it
+            params.append({  # Minimal stub the reviewer completes before deploying
+                "name": parameter["name"],  # Declared parameter name
+                "required": parameter["required"],  # Required flag from the param() block
+                "description": "(REVIEW) declared in the script's param() block; add a user-facing description.",
+            })
+            print(f"    ⚠ {script_name}: backfilled declared param {parameter['name']!r} the model omitted "
+                  "— add a description + a couple of example values before deploying")
+
     return {  # Assemble the final entry; the tool (not the model) sets the script filename
         "script": script_name,  # The exact .ps1 the executor will run (bare filename)
-        "params": inner.get("params", []),  # Parameter definitions (name / required / description)
-        "allowed_values": inner.get("allowed_values", {}),  # Per-param FORMAT EXAMPLES (not an enforced/complete list)
-        "examples": inner.get("examples", []),  # Natural-language -> params examples
+        "params": params,  # Parameter definitions (name / required / description), backfilled if needed
+        "allowed_values": allowed_values,  # Per-param FORMAT EXAMPLES (not an enforced/complete list)
+        "examples": examples,  # Natural-language -> params examples
     }
 
 
